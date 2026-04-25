@@ -1,15 +1,13 @@
 # gh-queue
 
-`gh-queue` is a small Node/TypeScript CLI that turns GitHub notifications into a local SQLite job queue.
+`gh-queue` is a tiny CLI that watches GitHub notifications for selected repositories and stores them in a local SQLite queue.
 
-It is intentionally conservative:
+It does only two things:
 
-- first poll does **not** backfill notifications
-- polling never uses read/unread as an actionability filter
-- repository filtering is explicit with `--repo`
-- `run-next` claims at most one queued job and prints its payload
-- it does not mark GitHub notifications read
-- it does not include workflow-specific prompts or automation policy
+1. `watch` — long-running poller that fills the queue.
+2. `next` — pops one queued notification and prints it as JSON.
+
+It does **not** decide whether a notification is actionable or mark GitHub notifications read.
 
 ## Install
 
@@ -24,107 +22,43 @@ Requirements:
 - Node 20+
 - `gh` CLI authenticated for notifications
 
-## Setup
+## Usage
 
-The default database is `./gh-queue.db`. Override it with `--db /path/to/gh-queue.db`.
-
-On the first poll without `--backfill` or `--since`, `gh-queue` initializes a checkpoint to now and enqueues nothing:
+Run the watcher:
 
 ```bash
-gh-queue poll --repo owner/repo --db ~/.local/state/gh-queue.db
+gh-queue watch --repo owner/repo --db ~/.local/state/gh-queue.db --interval 60s
 ```
 
-To intentionally import existing notifications:
+Pull the next queued notification:
 
 ```bash
-gh-queue poll --repo owner/repo --backfill --db ~/.local/state/gh-queue.db
-# or
-gh-queue poll --repo owner/repo --since 2026-04-25T00:00:00Z --db ~/.local/state/gh-queue.db
+gh-queue next --db ~/.local/state/gh-queue.db
 ```
+
+If the queue is empty, `next` prints:
+
+```text
+No queued jobs.
+```
+
+## Behavior
+
+- The first `watch` run initializes a checkpoint to the current time and does not backfill old notifications.
+- Later watch loops query GitHub notifications since the last checkpoint minus a 10-minute safety window.
+- `read`/`unread` is stored as metadata only and is never used as an actionability filter.
+- Repositories must be explicitly allowlisted with `--repo`.
+- Duplicate `(notificationId, updatedAt)` pairs are ignored.
+- `next` atomically marks one queued item as delivered before printing it.
 
 ## Commands
 
-### `poll`
-
-Fetches GitHub notifications with:
-
-```bash
-gh api --method GET notifications -F all=true -F per_page=100 -F since=... --paginate
+```text
+gh-queue watch --repo owner/name [--db path] [--interval 60s]
+gh-queue next [--db path]
 ```
 
-Normal polling uses the saved `lastSeenUpdatedAt` minus a 10 minute safety window. Matching notifications are stored raw in SQLite and unseen `(notificationId, updatedAt)` pairs are enqueued as jobs.
-
-Options:
-
-- `--repo owner/name` — allowlist repo; repeat or comma-separate
-- `--dry-run` — show what would be enqueued without writing
-- `--db path` — SQLite path
-- `--limit n` — cap fetched notifications after pagination output is parsed
-- `--backfill` — fetch without a `since` checkpoint
-- `--since ISO` — explicit checkpoint for this poll
-
-### `watch`
-
-Runs `poll` in a long-running loop.
-
-```bash
-gh-queue watch --repo owner/repo --db ~/.local/state/gh-queue.db --interval 60s
-```
-
-Options:
-
-- `--repo owner/name` — allowlist repo; repeat or comma-separate
-- `--db path` — SQLite path
-- `--interval duration` — default `60s`; supports `ms`, `s`, `m`, `h`
-- `--limit n` — cap fetched notifications per poll loop
-
-### `run-next`
-
-Claims one queued job, marks it `running`, records the claim, and prints the job plus raw notification payload as JSON.
-
-Options:
-
-- `--dry-run` — print the next job payload and leave the queue unchanged
-- `--record-dry-run` — with `--dry-run`, mark the job `dry_run_complete` and record a run
-- `--db path`
-
-### Queue inspection
-
-```bash
-gh-queue status --db ~/.local/state/gh-queue.db
-gh-queue jobs --status queued --db ~/.local/state/gh-queue.db
-gh-queue show 12 --db ~/.local/state/gh-queue.db
-```
-
-### Queue control
-
-```bash
-gh-queue complete 12 --db ~/.local/state/gh-queue.db
-gh-queue skip 12 --db ~/.local/state/gh-queue.db
-gh-queue retry 12 --db ~/.local/state/gh-queue.db
-```
-
-`retry` requeues jobs in `failed`, `skipped`, `dry_run_complete`, `running`, or `complete` state.
-
-## Examples
-
-Run the poller continuously:
-
-```bash
-gh-queue watch --repo owner/repo --db ~/.local/state/gh-queue.db --interval 60s
-```
-
-Claim at most one queued job from another process:
-
-```bash
-gh-queue run-next --db ~/.local/state/gh-queue.db
-```
-
-Dry-run the next queued job without mutating the queue:
-
-```bash
-gh-queue run-next --dry-run --db ~/.local/state/gh-queue.db
-```
+`--repo` can be repeated or comma-separated.
 
 ## Development
 
