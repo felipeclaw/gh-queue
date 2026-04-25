@@ -138,12 +138,14 @@ function setState(db: Database.Database, key: string, value: string): void {
 }
 
 async function ghNotifications(since: string | undefined, limit: number | undefined): Promise<GhNotification[]> {
-  const ghArgs = ["api", "--method", "GET", "notifications", "-F", "all=true", "-F", "per_page=100", "--paginate", "--slurp"];
+  const ghArgs = ["api", "--method", "GET", "notifications", "-F", "all=true", "-F", "per_page=100", "--paginate", "--jq", ".[]"];
   if (since) ghArgs.push("-F", `since=${since}`);
   const { stdout } = await execFileAsync("gh", ghArgs, { maxBuffer: 50 * 1024 * 1024 });
-  const parsed = JSON.parse(stdout || "[]") as unknown;
-  const flattened = Array.isArray(parsed) && parsed.every(Array.isArray) ? parsed.flat() : parsed;
-  const notifications = Array.isArray(flattened) ? flattened as GhNotification[] : [];
+  const notifications = stdout
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as GhNotification);
   return typeof limit === "number" ? notifications.slice(0, limit) : notifications;
 }
 
