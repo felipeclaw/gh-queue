@@ -45,7 +45,7 @@ Acknowledge after successful processing:
 gh-queue ack 1714080000000-0 --group workers
 ```
 
-For simple tests where printing counts as processing, consume and acknowledge in one command:
+If printing or forwarding the payload is the complete processing step, consume and acknowledge in one command:
 
 ```bash
 gh-queue next --group workers --consumer worker-1 --ack
