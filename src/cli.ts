@@ -192,6 +192,52 @@ async function watch(args: Args): Promise<void> {
   console.log(JSON.stringify({ watching: false }));
 }
 
+
+function parseSubjectNumber(apiUrl: string | undefined): number | null {
+  if (!apiUrl) return null;
+  const match = apiUrl.match(/\/(?:issues|pulls)\/(\d+)(?:$|[/?#])/);
+  return match ? Number(match[1]) : null;
+}
+
+function apiUrlToHtmlUrl(apiUrl: string | undefined): string | null {
+  if (!apiUrl) return null;
+  let match = apiUrl.match(/^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/);
+  if (match) return `https://github.com/${match[1]}/${match[2]}/pull/${match[3]}`;
+  match = apiUrl.match(/^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/);
+  if (match) return `https://github.com/${match[1]}/${match[2]}/issues/${match[3]}`;
+  return null;
+}
+
+function compactPayload(message: { id: string; message: Record<string, string> }, stream: string, group: string, consumer: string): unknown {
+  const subjectUrl = message.message.subjectUrl || undefined;
+  const latestCommentUrl = message.message.latestCommentUrl || undefined;
+  return {
+    queue: { stream, id: message.id, group, consumer },
+    notification: {
+      id: message.message.notificationId,
+      repo: message.message.repo,
+      reason: message.message.reason,
+      updatedAt: message.message.updatedAt,
+      unread: message.message.unread === "true",
+    },
+    subject: {
+      type: message.message.subjectType,
+      title: message.message.subjectTitle,
+      number: parseSubjectNumber(subjectUrl),
+      apiUrl: subjectUrl ?? null,
+      htmlUrl: apiUrlToHtmlUrl(subjectUrl),
+      latestCommentApiUrl: latestCommentUrl ?? null,
+    },
+  };
+}
+
+function rawPayload(message: { id: string; message: Record<string, string> }, stream: string, group: string, consumer: string): unknown {
+  return {
+    ...compactPayload(message, stream, group, consumer) as object,
+    raw: JSON.parse(message.message.raw),
+  };
+}
+
 async function next(args: Args): Promise<void> {
   const client = await redis(args);
   const stream = streamName(args);
@@ -205,24 +251,7 @@ async function next(args: Args): Promise<void> {
     return;
   }
   const message = response[0].messages[0];
-  const payload = {
-    stream,
-    group,
-    consumer,
-    id: message.id,
-    notification: {
-      notificationId: message.message.notificationId,
-      updatedAt: message.message.updatedAt,
-      repo: message.message.repo,
-      reason: message.message.reason,
-      subjectType: message.message.subjectType,
-      subjectTitle: message.message.subjectTitle,
-      subjectUrl: message.message.subjectUrl,
-      latestCommentUrl: message.message.latestCommentUrl,
-      unread: message.message.unread === "true",
-      raw: JSON.parse(message.message.raw),
-    },
-  };
+  const payload = hasFlag(args, "raw") ? rawPayload(message, stream, group, consumer) : compactPayload(message, stream, group, consumer);
   if (hasFlag(args, "ack")) await client.xAck(stream, group, message.id);
   console.log(JSON.stringify(payload, null, 2));
   await client.quit();
@@ -246,7 +275,7 @@ async function pending(args: Args): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  watch --repo owner/name [--redis url] [--stream name] [--interval 60s]\n  next [--redis url] [--stream name] [--group name] [--consumer name] [--ack]\n  ack <streamId> [--redis url] [--stream name] [--group name]\n  pending [--redis url] [--stream name] [--group name]`);
+  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  watch --repo owner/name [--redis url] [--stream name] [--interval 60s]\n  next [--redis url] [--stream name] [--group name] [--consumer name] [--ack] [--raw]\n  ack <streamId> [--redis url] [--stream name] [--group name]\n  pending [--redis url] [--stream name] [--group name]`);
 }
 
 async function main(): Promise<void> {

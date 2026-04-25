@@ -5,7 +5,7 @@
 It does only a few queue-oriented things:
 
 1. `watch` — long-running poller that fills a Redis Stream.
-2. `next` — consumes one queued notification from a Redis consumer group and prints it as JSON.
+2. `next` — consumes one queued notification from a Redis consumer group and prints a compact JSON payload.
 3. `ack` — acknowledges a consumed stream message after successful processing.
 4. `pending` — inspects pending messages for the consumer group.
 
@@ -65,12 +65,13 @@ No queued jobs.
 - Repositories must be explicitly allowlisted with `--repo`.
 - Duplicate `(notificationId, updatedAt)` pairs are ignored via Redis dedupe keys.
 - Redis consumer groups provide delivery tracking: a message remains pending until `ack` is called.
+- `next` returns a compact payload by default; use `--raw` to include the original GitHub notification payload.
 
 ## Commands
 
 ```text
 gh-queue watch --repo owner/name [--redis url] [--stream name] [--interval 60s]
-gh-queue next [--redis url] [--stream name] [--group name] [--consumer name] [--ack]
+gh-queue next [--redis url] [--stream name] [--group name] [--consumer name] [--ack] [--raw]
 gh-queue ack <streamId> [--redis url] [--stream name] [--group name]
 gh-queue pending [--redis url] [--stream name] [--group name]
 ```
