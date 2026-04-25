@@ -68,6 +68,24 @@ function toIso(value: string | Date): string {
   return new Date(value).toISOString();
 }
 
+
+function parseDurationMs(value: string | undefined, fallbackMs: number): number {
+  if (!value) return fallbackMs;
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)(ms|s|m|h)?$/);
+  if (!match) throw new Error(`Invalid duration: ${value}`);
+  const amount = Number(match[1]);
+  const unit = match[2] ?? "ms";
+  if (unit === "ms") return amount;
+  if (unit === "s") return amount * 1000;
+  if (unit === "m") return amount * 60 * 1000;
+  if (unit === "h") return amount * 60 * 60 * 1000;
+  return fallbackMs;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function repoAllowlist(args: Args): string[] {
   const raw = args.repo;
   const values = Array.isArray(raw) ? raw : raw ? [String(raw)] : [];
@@ -202,6 +220,25 @@ async function poll(args: Args): Promise<void> {
   console.log(JSON.stringify({ dryRun, since: since ?? null, repos: [...allow], fetched: notifications.length, matched: filtered.length, enqueued: newJobs, checkpoint: maxUpdatedAt }, null, 2));
 }
 
+
+async function watch(args: Args): Promise<void> {
+  if (hasFlag(args, "dry-run")) throw new Error("watch does not support --dry-run; use poll --dry-run instead");
+  const intervalMs = parseDurationMs(asString(args.interval, "60s"), 60_000);
+  let stopping = false;
+  process.on("SIGINT", () => { stopping = true; });
+  process.on("SIGTERM", () => { stopping = true; });
+  console.log(JSON.stringify({ watching: true, intervalMs, repos: repoAllowlist(args), db: asString(args.db, DEFAULT_DB) }));
+  while (!stopping) {
+    try {
+      await poll(args);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+    }
+    if (!stopping) await sleep(intervalMs);
+  }
+  console.log(JSON.stringify({ watching: false }));
+}
+
 function jobPayload(job: Job): unknown {
   return {
     job: {
@@ -311,8 +348,7 @@ function retry(args: Args, jobId: number): void {
 }
 
 function usage(): void {
-  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  poll [--repo owner/name] [--db path] [--dry-run] [--backfill|--since ISO] [--limit n]\n  run-next [--db path] [--dry-run] [--record-dry-run] [--timeout seconds]\n  status [--db path]\n  jobs [--db path] [--status queued] [--limit n]\n  show <jobId> [--db path]\n  skip <jobId> [--db path]\n  complete <jobId> [--db path]
-  retry <jobId> [--db path]`);
+  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  poll [--repo owner/name] [--db path] [--dry-run] [--backfill|--since ISO] [--limit n]\n  watch [--repo owner/name] [--db path] [--interval 60s] [--limit n]\n  run-next [--db path] [--dry-run] [--record-dry-run]\n  status [--db path]\n  jobs [--db path] [--status queued] [--limit n]\n  show <jobId> [--db path]\n  skip <jobId> [--db path]\n  complete <jobId> [--db path]\n  retry <jobId> [--db path]`);
 }
 
 async function main(): Promise<void> {
@@ -320,6 +356,7 @@ async function main(): Promise<void> {
   const command = args._[0];
   try {
     if (command === "poll") await poll(args);
+    else if (command === "watch") await watch(args);
     else if (command === "run-next") await runNext(args);
     else if (command === "status") status(args);
     else if (command === "jobs") jobs(args);

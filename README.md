@@ -63,6 +63,21 @@ Options:
 - `--backfill` — fetch without a `since` checkpoint
 - `--since ISO` — explicit checkpoint for this poll
 
+### `watch`
+
+Runs `poll` in a long-running loop.
+
+```bash
+gh-queue watch --repo owner/repo --db ~/.local/state/gh-queue.db --interval 60s
+```
+
+Options:
+
+- `--repo owner/name` — allowlist repo; repeat or comma-separate
+- `--db path` — SQLite path
+- `--interval duration` — default `60s`; supports `ms`, `s`, `m`, `h`
+- `--limit n` — cap fetched notifications per poll loop
+
 ### `run-next`
 
 Claims one queued job, marks it `running`, records the claim, and prints the job plus raw notification payload as JSON.
@@ -91,18 +106,18 @@ gh-queue retry 12 --db ~/.local/state/gh-queue.db
 
 `retry` requeues jobs in `failed`, `skipped`, `dry_run_complete`, `running`, or `complete` state.
 
-## Cron examples
+## Examples
 
-Poll every 10 minutes:
+Run the poller continuously:
 
-```cron
-*/10 * * * * cd /path/to/gh-queue && /usr/bin/env gh-queue poll --repo owner/repo --db ~/.local/state/gh-queue.db >> ~/.local/state/gh-queue.log 2>&1
+```bash
+gh-queue watch --repo owner/repo --db ~/.local/state/gh-queue.db --interval 60s
 ```
 
-Claim at most one queued job every 15 minutes:
+Claim at most one queued job from another process:
 
-```cron
-*/15 * * * * cd /path/to/gh-queue && /usr/bin/env gh-queue run-next --db ~/.local/state/gh-queue.db >> ~/.local/state/gh-queue.log 2>&1
+```bash
+gh-queue run-next --db ~/.local/state/gh-queue.db
 ```
 
 Dry-run the next queued job without mutating the queue:
