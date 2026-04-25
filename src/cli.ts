@@ -1,13 +1,15 @@
 #!/usr/bin/env node
-import Database from "better-sqlite3";
+import { createClient } from "redis";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { resolve } from "node:path";
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_DB = "./gh-queue.db";
 const DEFAULT_INTERVAL_MS = 60_000;
 const SAFETY_WINDOW_MS = 10 * 60 * 1000;
+const DEFAULT_REDIS_URL = "redis://127.0.0.1:6379";
+const DEFAULT_STREAM = "ghq:notifications";
+const DEFAULT_GROUP = "ghq";
+const DEFAULT_CONSUMER = `consumer-${process.pid}`;
 
 type Args = { _: string[]; [key: string]: string | boolean | string[] };
 type GhNotification = {
@@ -19,14 +21,7 @@ type GhNotification = {
   subject?: { title?: string; type?: string; url?: string; latest_comment_url?: string };
   url?: string;
 };
-type QueuedJob = {
-  id: number;
-  notification_id: string;
-  notification_updated_at: string;
-  repo: string;
-  created_at: string;
-  notification_json: string;
-};
+type RedisClient = ReturnType<typeof createClient>;
 
 function parseArgs(argv: string[]): Args {
   const args: Args = { _: [] };
@@ -51,6 +46,10 @@ function asString(value: unknown, fallback?: string): string | undefined {
   if (typeof value === "boolean" || value == null) return fallback;
   if (Array.isArray(value)) return value[value.length - 1];
   return String(value);
+}
+
+function hasFlag(args: Args, name: string): boolean {
+  return args[name] === true || args[name] === "true";
 }
 
 function nowIso(): string {
@@ -84,62 +83,35 @@ function repoAllowlist(args: Args): string[] {
   return values.flatMap((v) => v.split(",").map((s) => s.trim()).filter(Boolean));
 }
 
-function openDb(args: Args): Database.Database {
-  const db = new Database(resolve(asString(args.db, DEFAULT_DB)!));
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS state (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS notifications (
-      notification_id TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      repo TEXT NOT NULL,
-      unread INTEGER NOT NULL,
-      reason TEXT,
-      subject_type TEXT,
-      subject_title TEXT,
-      raw_json TEXT NOT NULL,
-      stored_at TEXT NOT NULL,
-      PRIMARY KEY (notification_id, updated_at)
-    );
-    CREATE TABLE IF NOT EXISTS jobs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      notification_id TEXT NOT NULL,
-      notification_updated_at TEXT NOT NULL,
-      repo TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'queued',
-      attempts INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      delivered_at TEXT,
-      UNIQUE (notification_id, notification_updated_at)
-    );
-  `);
-  ensureColumn(db, "jobs", "attempts", "INTEGER NOT NULL DEFAULT 0");
-  ensureColumn(db, "jobs", "updated_at", "TEXT");
-  ensureColumn(db, "jobs", "delivered_at", "TEXT");
-  db.prepare("UPDATE jobs SET updated_at=created_at WHERE updated_at IS NULL").run();
-  return db;
+function redisUrl(args: Args): string {
+  return asString(args.redis, process.env.REDIS_URL || DEFAULT_REDIS_URL)!;
 }
 
-function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-  if (!columns.some((entry) => entry.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+function streamName(args: Args): string {
+  return asString(args.stream, DEFAULT_STREAM)!;
+}
+
+function groupName(args: Args): string {
+  return asString(args.group, DEFAULT_GROUP)!;
+}
+
+function consumerName(args: Args): string {
+  return asString(args.consumer, DEFAULT_CONSUMER)!;
+}
+
+async function redis(args: Args): Promise<RedisClient> {
+  const client = createClient({ url: redisUrl(args) });
+  client.on("error", (error) => console.error(error instanceof Error ? error.message : String(error)));
+  await client.connect();
+  return client;
+}
+
+async function ensureGroup(client: RedisClient, stream: string, group: string): Promise<void> {
+  try {
+    await client.xGroupCreate(stream, group, "0", { MKSTREAM: true });
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("BUSYGROUP")) throw error;
   }
-}
-
-function getState(db: Database.Database, key: string): string | undefined {
-  return (db.prepare("SELECT value FROM state WHERE key = ?").get(key) as { value: string } | undefined)?.value;
-}
-
-function setState(db: Database.Database, key: string, value: string): void {
-  db.prepare("INSERT INTO state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
-    .run(key, value, nowIso());
 }
 
 async function ghNotifications(since: string): Promise<GhNotification[]> {
@@ -152,101 +124,129 @@ async function ghNotifications(since: string): Promise<GhNotification[]> {
     .map((line) => JSON.parse(line) as GhNotification);
 }
 
-function insertNotification(db: Database.Database, n: GhNotification): boolean {
-  const repo = n.repository?.full_name ?? "";
-  const inserted = db.prepare(`INSERT OR IGNORE INTO notifications
-    (notification_id, updated_at, repo, unread, reason, subject_type, subject_title, raw_json, stored_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`) 
-    .run(n.id, n.updated_at, repo, n.unread ? 1 : 0, n.reason ?? null, n.subject?.type ?? null, n.subject?.title ?? null, JSON.stringify(n), nowIso()).changes > 0;
-  if (inserted) {
-    db.prepare(`INSERT OR IGNORE INTO jobs(notification_id, notification_updated_at, repo, status, attempts, created_at, updated_at)
-      VALUES (?, ?, ?, 'queued', 0, ?, ?)`) 
-      .run(n.id, n.updated_at, repo, nowIso(), nowIso());
-  }
-  return inserted;
+function notificationPayload(n: GhNotification): Record<string, string> {
+  return {
+    notificationId: n.id,
+    updatedAt: n.updated_at,
+    repo: n.repository?.full_name ?? "",
+    reason: n.reason ?? "",
+    subjectType: n.subject?.type ?? "",
+    subjectTitle: n.subject?.title ?? "",
+    subjectUrl: n.subject?.url ?? "",
+    latestCommentUrl: n.subject?.latest_comment_url ?? "",
+    unread: n.unread ? "true" : "false",
+    raw: JSON.stringify(n),
+  };
 }
 
-async function pollOnce(db: Database.Database, repos: string[]): Promise<{ since: string; fetched: number; matched: number; enqueued: number; checkpoint: string }> {
+async function pollOnce(client: RedisClient, args: Args, repos: string[]): Promise<{ since: string; fetched: number; matched: number; enqueued: number; checkpoint: string }> {
   if (!repos.length) throw new Error("watch requires at least one --repo owner/name allowlist entry");
+  const stream = streamName(args);
   const allow = new Set(repos);
-  const stateKey = `lastSeenUpdatedAt:${[...allow].sort().join(",")}`;
-  const lastSeen = getState(db, stateKey);
+  const stateKey = `ghq:lastSeen:${[...allow].sort().join(",")}`;
+  const lastSeen = await client.get(stateKey);
 
   if (!lastSeen) {
     const checkpoint = nowIso();
-    setState(db, stateKey, checkpoint);
+    await client.set(stateKey, checkpoint);
     return { since: checkpoint, fetched: 0, matched: 0, enqueued: 0, checkpoint };
   }
 
   const since = toIso(new Date(new Date(lastSeen).getTime() - SAFETY_WINDOW_MS));
   const notifications = await ghNotifications(since);
   const filtered = notifications.filter((n) => n.id && n.updated_at && allow.has(n.repository?.full_name ?? ""));
-  let enqueued = 0;
   let checkpoint = lastSeen;
+  let enqueued = 0;
 
-  const tx = db.transaction(() => {
-    for (const n of filtered) {
-      if (n.updated_at > checkpoint) checkpoint = n.updated_at;
-      if (insertNotification(db, n)) enqueued++;
+  for (const n of filtered) {
+    if (n.updated_at > checkpoint) checkpoint = n.updated_at;
+    const seenKey = `ghq:seen:${n.id}:${n.updated_at}`;
+    const inserted = await client.set(seenKey, "1", { NX: true });
+    if (inserted) {
+      await client.xAdd(stream, "*", notificationPayload(n));
+      enqueued++;
     }
-    setState(db, stateKey, checkpoint);
-  });
-  tx();
-
+  }
+  await client.set(stateKey, checkpoint);
   return { since, fetched: notifications.length, matched: filtered.length, enqueued, checkpoint };
 }
 
 async function watch(args: Args): Promise<void> {
   const repos = repoAllowlist(args);
   const intervalMs = parseDurationMs(asString(args.interval, "60s"), DEFAULT_INTERVAL_MS);
-  const db = openDb(args);
+  const client = await redis(args);
   let stopping = false;
   process.on("SIGINT", () => { stopping = true; });
   process.on("SIGTERM", () => { stopping = true; });
 
-  console.log(JSON.stringify({ watching: true, intervalMs, repos, db: asString(args.db, DEFAULT_DB) }));
+  console.log(JSON.stringify({ watching: true, intervalMs, repos, redis: redisUrl(args), stream: streamName(args) }));
   while (!stopping) {
     try {
-      console.log(JSON.stringify(await pollOnce(db, repos)));
+      console.log(JSON.stringify(await pollOnce(client, args, repos)));
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
     }
     if (!stopping) await sleep(intervalMs);
   }
+  await client.quit();
   console.log(JSON.stringify({ watching: false }));
 }
 
-function next(args: Args): void {
-  const db = openDb(args);
-  const tx = db.transaction(() => {
-    const job = db.prepare(`SELECT j.*, n.raw_json AS notification_json FROM jobs j
-      JOIN notifications n ON n.notification_id=j.notification_id AND n.updated_at=j.notification_updated_at
-      WHERE j.status='queued'
-      ORDER BY j.created_at ASC, j.id ASC
-      LIMIT 1`).get() as QueuedJob | undefined;
-    if (!job) return undefined;
-    db.prepare("UPDATE jobs SET status='delivered', updated_at=?, delivered_at=? WHERE id=? AND status='queued'").run(nowIso(), nowIso(), job.id);
-    return {
-      job: {
-        id: job.id,
-        repo: job.repo,
-        notificationId: job.notification_id,
-        notificationUpdatedAt: job.notification_updated_at,
-        createdAt: job.created_at,
-      },
-      notification: JSON.parse(job.notification_json),
-    };
-  });
-  const payload = tx();
-  if (!payload) {
+async function next(args: Args): Promise<void> {
+  const client = await redis(args);
+  const stream = streamName(args);
+  const group = groupName(args);
+  const consumer = consumerName(args);
+  await ensureGroup(client, stream, group);
+  const response = await client.xReadGroup(group, consumer, [{ key: stream, id: ">" }], { COUNT: 1, BLOCK: 1 });
+  if (!response?.length || !response[0]?.messages.length) {
     console.log("No queued jobs.");
+    await client.quit();
     return;
   }
+  const message = response[0].messages[0];
+  const payload = {
+    stream,
+    group,
+    consumer,
+    id: message.id,
+    notification: {
+      notificationId: message.message.notificationId,
+      updatedAt: message.message.updatedAt,
+      repo: message.message.repo,
+      reason: message.message.reason,
+      subjectType: message.message.subjectType,
+      subjectTitle: message.message.subjectTitle,
+      subjectUrl: message.message.subjectUrl,
+      latestCommentUrl: message.message.latestCommentUrl,
+      unread: message.message.unread === "true",
+      raw: JSON.parse(message.message.raw),
+    },
+  };
+  if (hasFlag(args, "ack")) await client.xAck(stream, group, message.id);
   console.log(JSON.stringify(payload, null, 2));
+  await client.quit();
+}
+
+async function ack(args: Args): Promise<void> {
+  const id = args._[1];
+  if (!id) throw new Error("ack requires a stream message id");
+  const client = await redis(args);
+  const count = await client.xAck(streamName(args), groupName(args), id);
+  console.log(JSON.stringify({ acked: count, id }));
+  await client.quit();
+}
+
+async function pending(args: Args): Promise<void> {
+  const client = await redis(args);
+  await ensureGroup(client, streamName(args), groupName(args));
+  const result = await client.xPending(streamName(args), groupName(args));
+  console.log(JSON.stringify(result, null, 2));
+  await client.quit();
 }
 
 function usage(): void {
-  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  watch --repo owner/name [--db path] [--interval 60s]\n  next [--db path]`);
+  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  watch --repo owner/name [--redis url] [--stream name] [--interval 60s]\n  next [--redis url] [--stream name] [--group name] [--consumer name] [--ack]\n  ack <streamId> [--redis url] [--stream name] [--group name]\n  pending [--redis url] [--stream name] [--group name]`);
 }
 
 async function main(): Promise<void> {
@@ -254,7 +254,9 @@ async function main(): Promise<void> {
   const command = args._[0];
   try {
     if (command === "watch") await watch(args);
-    else if (command === "next") next(args);
+    else if (command === "next") await next(args);
+    else if (command === "ack") await ack(args);
+    else if (command === "pending") await pending(args);
     else {
       usage();
       process.exitCode = command ? 1 : 0;

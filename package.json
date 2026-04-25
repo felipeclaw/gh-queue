@@ -1,7 +1,7 @@
 {
   "name": "gh-queue",
   "version": "0.1.0",
-  "description": "Queue GitHub notifications into local SQLite jobs.",
+  "description": "Queue GitHub notifications into Redis Streams.",
   "type": "module",
   "bin": {
     "gh-queue": "dist/cli.js"
@@ -15,7 +15,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.1"
+    "redis": "^4.7.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
