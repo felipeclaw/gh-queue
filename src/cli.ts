@@ -112,12 +112,25 @@ function openDb(args: Args): Database.Database {
       notification_updated_at TEXT NOT NULL,
       repo TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
       delivered_at TEXT,
       UNIQUE (notification_id, notification_updated_at)
     );
   `);
+  ensureColumn(db, "jobs", "attempts", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "jobs", "updated_at", "TEXT");
+  ensureColumn(db, "jobs", "delivered_at", "TEXT");
+  db.prepare("UPDATE jobs SET updated_at=created_at WHERE updated_at IS NULL").run();
   return db;
+}
+
+function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!columns.some((entry) => entry.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 function getState(db: Database.Database, key: string): string | undefined {
@@ -146,9 +159,9 @@ function insertNotification(db: Database.Database, n: GhNotification): boolean {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`) 
     .run(n.id, n.updated_at, repo, n.unread ? 1 : 0, n.reason ?? null, n.subject?.type ?? null, n.subject?.title ?? null, JSON.stringify(n), nowIso()).changes > 0;
   if (inserted) {
-    db.prepare(`INSERT OR IGNORE INTO jobs(notification_id, notification_updated_at, repo, status, created_at)
-      VALUES (?, ?, ?, 'queued', ?)`) 
-      .run(n.id, n.updated_at, repo, nowIso());
+    db.prepare(`INSERT OR IGNORE INTO jobs(notification_id, notification_updated_at, repo, status, attempts, created_at, updated_at)
+      VALUES (?, ?, ?, 'queued', 0, ?, ?)`) 
+      .run(n.id, n.updated_at, repo, nowIso(), nowIso());
   }
   return inserted;
 }
@@ -212,7 +225,7 @@ function next(args: Args): void {
       ORDER BY j.created_at ASC, j.id ASC
       LIMIT 1`).get() as QueuedJob | undefined;
     if (!job) return undefined;
-    db.prepare("UPDATE jobs SET status='delivered', delivered_at=? WHERE id=? AND status='queued'").run(nowIso(), job.id);
+    db.prepare("UPDATE jobs SET status='delivered', updated_at=?, delivered_at=? WHERE id=? AND status='queued'").run(nowIso(), nowIso(), job.id);
     return {
       job: {
         id: job.id,
