@@ -1,7 +1,7 @@
 {
   "name": "gh-queue",
   "version": "0.1.0",
-  "description": "Queue GitHub notifications into Redis Streams.",
+  "description": "Queue GitHub notifications by issue and pull request number.",
   "type": "module",
   "bin": {
     "gh-queue": "dist/cli.js"
@@ -15,11 +15,12 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "redis": "^4.7.0"
+    "better-sqlite3": "^11.8.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "@types/better-sqlite3": "^7.6.13"
   },
   "engines": {
     "node": ">=20"

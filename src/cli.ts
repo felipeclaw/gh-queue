@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-import { createClient } from "redis";
+import Database from "better-sqlite3";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { resolve } from "node:path";
 
 const execFileAsync = promisify(execFile);
+const DEFAULT_DB = "./gh-queue.db";
 const DEFAULT_INTERVAL_MS = 60_000;
+const DEFAULT_LEASE_MS = 90 * 60 * 1000;
+const DEFAULT_MAX_ATTEMPTS = 5;
 const SAFETY_WINDOW_MS = 10 * 60 * 1000;
-const DEFAULT_REDIS_URL = "redis://127.0.0.1:6379";
-const DEFAULT_STREAM = "ghq:notifications";
-const DEFAULT_GROUP = "ghq";
-const DEFAULT_CONSUMER = `consumer-${process.pid}`;
 
 type Args = { _: string[]; [key: string]: string | boolean | string[] };
 type GhNotification = {
@@ -21,7 +21,21 @@ type GhNotification = {
   subject?: { title?: string; type?: string; url?: string; latest_comment_url?: string };
   url?: string;
 };
-type RedisClient = ReturnType<typeof createClient>;
+type ItemRow = {
+  repo: string;
+  number: number;
+  subject_type: string | null;
+  status: string;
+  dirty: number;
+  attempts: number;
+  notification_count: number;
+  latest_notification_updated_at: string;
+  delivered_at: string | null;
+  lease_until: string | null;
+  worker_id: string | null;
+  last_error: string | null;
+  updated_at: string;
+};
 
 function parseArgs(argv: string[]): Args {
   const args: Args = { _: [] };
@@ -56,6 +70,10 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function addMsIso(ms: number): string {
+  return new Date(Date.now() + ms).toISOString();
+}
+
 function toIso(value: string | Date): string {
   return new Date(value).toISOString();
 }
@@ -83,35 +101,58 @@ function repoAllowlist(args: Args): string[] {
   return values.flatMap((v) => v.split(",").map((s) => s.trim()).filter(Boolean));
 }
 
-function redisUrl(args: Args): string {
-  return asString(args.redis, process.env.REDIS_URL || DEFAULT_REDIS_URL)!;
+function openDb(args: Args): Database.Database {
+  const db = new Database(resolve(asString(args.db, DEFAULT_DB)!));
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS notifications (
+      notification_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      repo TEXT NOT NULL,
+      number INTEGER NOT NULL,
+      subject_type TEXT,
+      reason TEXT,
+      subject_title TEXT,
+      subject_url TEXT,
+      latest_comment_url TEXT,
+      unread INTEGER NOT NULL,
+      raw_json TEXT NOT NULL,
+      stored_at TEXT NOT NULL,
+      PRIMARY KEY (notification_id, updated_at)
+    );
+    CREATE TABLE IF NOT EXISTS items (
+      repo TEXT NOT NULL,
+      number INTEGER NOT NULL,
+      subject_type TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      dirty INTEGER NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      notification_count INTEGER NOT NULL DEFAULT 0,
+      latest_notification_updated_at TEXT NOT NULL,
+      delivered_at TEXT,
+      lease_until TEXT,
+      worker_id TEXT,
+      last_error TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (repo, number)
+    );
+  `);
+  return db;
 }
 
-function streamName(args: Args): string {
-  return asString(args.stream, DEFAULT_STREAM)!;
+function getState(db: Database.Database, key: string): string | undefined {
+  return (db.prepare("SELECT value FROM state WHERE key = ?").get(key) as { value: string } | undefined)?.value;
 }
 
-function groupName(args: Args): string {
-  return asString(args.group, DEFAULT_GROUP)!;
-}
-
-function consumerName(args: Args): string {
-  return asString(args.consumer, DEFAULT_CONSUMER)!;
-}
-
-async function redis(args: Args): Promise<RedisClient> {
-  const client = createClient({ url: redisUrl(args) });
-  client.on("error", (error) => console.error(error instanceof Error ? error.message : String(error)));
-  await client.connect();
-  return client;
-}
-
-async function ensureGroup(client: RedisClient, stream: string, group: string): Promise<void> {
-  try {
-    await client.xGroupCreate(stream, group, "0", { MKSTREAM: true });
-  } catch (error) {
-    if (!(error instanceof Error) || !error.message.includes("BUSYGROUP")) throw error;
-  }
+function setState(db: Database.Database, key: string, value: string): void {
+  db.prepare("INSERT INTO state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
+    .run(key, value, nowIso());
 }
 
 async function ghNotifications(since: string): Promise<GhNotification[]> {
@@ -124,158 +165,234 @@ async function ghNotifications(since: string): Promise<GhNotification[]> {
     .map((line) => JSON.parse(line) as GhNotification);
 }
 
-function notificationPayload(n: GhNotification): Record<string, string> {
+function extractNumberFromUrl(url: string | undefined): number | null {
+  if (!url) return null;
+  const match = url.match(/\/(?:issues|pulls)\/(\d+)(?:$|[/?#])/);
+  return match ? Number(match[1]) : null;
+}
+
+function notificationNumber(n: GhNotification): number | null {
+  return extractNumberFromUrl(n.subject?.url) ?? extractNumberFromUrl(n.subject?.latest_comment_url);
+}
+
+function apiUrlToHtmlUrl(apiUrl: string | undefined, type: string | null | undefined): string | null {
+  if (!apiUrl) return null;
+  let match = apiUrl.match(/^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/);
+  if (match) return `https://github.com/${match[1]}/${match[2]}/pull/${match[3]}`;
+  match = apiUrl.match(/^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/);
+  if (match) return `https://github.com/${match[1]}/${match[2]}/${type === "PullRequest" ? "pull" : "issues"}/${match[3]}`;
+  return null;
+}
+
+function compactNotification(n: GhNotification): unknown {
   return {
-    notificationId: n.id,
+    id: n.id,
+    reason: n.reason ?? null,
     updatedAt: n.updated_at,
-    repo: n.repository?.full_name ?? "",
-    reason: n.reason ?? "",
-    subjectType: n.subject?.type ?? "",
-    subjectTitle: n.subject?.title ?? "",
-    subjectUrl: n.subject?.url ?? "",
-    latestCommentUrl: n.subject?.latest_comment_url ?? "",
-    unread: n.unread ? "true" : "false",
-    raw: JSON.stringify(n),
+    unread: Boolean(n.unread),
+    subject: {
+      type: n.subject?.type ?? null,
+      title: n.subject?.title ?? null,
+      number: notificationNumber(n),
+      apiUrl: n.subject?.url ?? null,
+      htmlUrl: apiUrlToHtmlUrl(n.subject?.url, n.subject?.type),
+      latestCommentApiUrl: n.subject?.latest_comment_url ?? null,
+    },
   };
 }
 
-async function pollOnce(client: RedisClient, args: Args, repos: string[]): Promise<{ since: string; fetched: number; matched: number; enqueued: number; checkpoint: string }> {
+function insertNotification(db: Database.Database, n: GhNotification): boolean {
+  const repo = n.repository?.full_name ?? "";
+  const number = notificationNumber(n);
+  if (!repo || number == null) return false;
+  const ts = nowIso();
+  const inserted = db.prepare(`INSERT OR IGNORE INTO notifications
+    (notification_id, updated_at, repo, number, subject_type, reason, subject_title, subject_url, latest_comment_url, unread, raw_json, stored_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      n.id,
+      n.updated_at,
+      repo,
+      number,
+      n.subject?.type ?? null,
+      n.reason ?? null,
+      n.subject?.title ?? null,
+      n.subject?.url ?? null,
+      n.subject?.latest_comment_url ?? null,
+      n.unread ? 1 : 0,
+      JSON.stringify(n),
+      ts,
+    ).changes > 0;
+  if (!inserted) return false;
+
+  const existing = db.prepare("SELECT status FROM items WHERE repo=? AND number=?").get(repo, number) as { status: string } | undefined;
+  if (!existing) {
+    db.prepare(`INSERT INTO items(repo, number, subject_type, status, dirty, attempts, notification_count, latest_notification_updated_at, updated_at)
+      VALUES (?, ?, ?, 'queued', 0, 0, 1, ?, ?)`)
+      .run(repo, number, n.subject?.type ?? null, n.updated_at, ts);
+  } else {
+    const status = existing.status;
+    const nextStatus = status === "delivered" ? "delivered" : "queued";
+    const dirty = status === "delivered" ? 1 : 0;
+    db.prepare(`UPDATE items SET
+      subject_type=COALESCE(subject_type, ?),
+      status=?,
+      dirty=CASE WHEN ? = 1 THEN 1 ELSE dirty END,
+      notification_count=notification_count + 1,
+      latest_notification_updated_at=MAX(latest_notification_updated_at, ?),
+      updated_at=?
+      WHERE repo=? AND number=?`)
+      .run(n.subject?.type ?? null, nextStatus, dirty, n.updated_at, ts, repo, number);
+  }
+  return true;
+}
+
+async function pollOnce(db: Database.Database, repos: string[]): Promise<{ since: string; fetched: number; matched: number; enqueued: number; checkpoint: string }> {
   if (!repos.length) throw new Error("watch requires at least one --repo owner/name allowlist entry");
-  const stream = streamName(args);
   const allow = new Set(repos);
-  const stateKey = `ghq:lastSeen:${[...allow].sort().join(",")}`;
-  const lastSeen = await client.get(stateKey);
+  const stateKey = `lastSeenUpdatedAt:${[...allow].sort().join(",")}`;
+  const lastSeen = getState(db, stateKey);
 
   if (!lastSeen) {
     const checkpoint = nowIso();
-    await client.set(stateKey, checkpoint);
+    setState(db, stateKey, checkpoint);
     return { since: checkpoint, fetched: 0, matched: 0, enqueued: 0, checkpoint };
   }
 
   const since = toIso(new Date(new Date(lastSeen).getTime() - SAFETY_WINDOW_MS));
   const notifications = await ghNotifications(since);
   const filtered = notifications.filter((n) => n.id && n.updated_at && allow.has(n.repository?.full_name ?? ""));
-  let checkpoint = lastSeen;
   let enqueued = 0;
+  let checkpoint = lastSeen;
 
-  for (const n of filtered) {
-    if (n.updated_at > checkpoint) checkpoint = n.updated_at;
-    const seenKey = `ghq:seen:${n.id}:${n.updated_at}`;
-    const inserted = await client.set(seenKey, "1", { NX: true });
-    if (inserted) {
-      await client.xAdd(stream, "*", notificationPayload(n));
-      enqueued++;
+  const tx = db.transaction(() => {
+    for (const n of filtered) {
+      if (n.updated_at > checkpoint) checkpoint = n.updated_at;
+      if (insertNotification(db, n)) enqueued++;
     }
-  }
-  await client.set(stateKey, checkpoint);
+    setState(db, stateKey, checkpoint);
+  });
+  tx();
+
   return { since, fetched: notifications.length, matched: filtered.length, enqueued, checkpoint };
 }
 
 async function watch(args: Args): Promise<void> {
   const repos = repoAllowlist(args);
   const intervalMs = parseDurationMs(asString(args.interval, "60s"), DEFAULT_INTERVAL_MS);
-  const client = await redis(args);
+  const db = openDb(args);
   let stopping = false;
   process.on("SIGINT", () => { stopping = true; });
   process.on("SIGTERM", () => { stopping = true; });
 
-  console.log(JSON.stringify({ watching: true, intervalMs, repos, redis: redisUrl(args), stream: streamName(args) }));
+  console.log(JSON.stringify({ watching: true, intervalMs, repos, db: asString(args.db, DEFAULT_DB) }));
   while (!stopping) {
     try {
-      console.log(JSON.stringify(await pollOnce(client, args, repos)));
+      console.log(JSON.stringify(await pollOnce(db, repos)));
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
     }
     if (!stopping) await sleep(intervalMs);
   }
-  await client.quit();
   console.log(JSON.stringify({ watching: false }));
 }
 
-
-function parseSubjectNumber(apiUrl: string | undefined): number | null {
-  if (!apiUrl) return null;
-  const match = apiUrl.match(/\/(?:issues|pulls)\/(\d+)(?:$|[/?#])/);
-  return match ? Number(match[1]) : null;
+function itemNotifications(db: Database.Database, item: Pick<ItemRow, "repo" | "number">, raw: boolean): unknown[] {
+  const rows = db.prepare(`SELECT raw_json FROM notifications WHERE repo=? AND number=? ORDER BY updated_at ASC, stored_at ASC`).all(item.repo, item.number) as { raw_json: string }[];
+  return rows.map((row) => {
+    const parsed = JSON.parse(row.raw_json) as GhNotification;
+    return raw ? parsed : compactNotification(parsed);
+  });
 }
 
-function apiUrlToHtmlUrl(apiUrl: string | undefined): string | null {
-  if (!apiUrl) return null;
-  let match = apiUrl.match(/^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/);
-  if (match) return `https://github.com/${match[1]}/${match[2]}/pull/${match[3]}`;
-  match = apiUrl.match(/^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/);
-  if (match) return `https://github.com/${match[1]}/${match[2]}/issues/${match[3]}`;
-  return null;
-}
-
-function compactPayload(message: { id: string; message: Record<string, string> }, stream: string, group: string, consumer: string): unknown {
-  const subjectUrl = message.message.subjectUrl || undefined;
-  const latestCommentUrl = message.message.latestCommentUrl || undefined;
-  return {
-    queue: { stream, id: message.id, group, consumer },
-    notification: {
-      id: message.message.notificationId,
-      repo: message.message.repo,
-      reason: message.message.reason,
-      updatedAt: message.message.updatedAt,
-      unread: message.message.unread === "true",
-    },
-    subject: {
-      type: message.message.subjectType,
-      title: message.message.subjectTitle,
-      number: parseSubjectNumber(subjectUrl),
-      apiUrl: subjectUrl ?? null,
-      htmlUrl: apiUrlToHtmlUrl(subjectUrl),
-      latestCommentApiUrl: latestCommentUrl ?? null,
-    },
-  };
-}
-
-function rawPayload(message: { id: string; message: Record<string, string> }, stream: string, group: string, consumer: string): unknown {
-  return {
-    ...compactPayload(message, stream, group, consumer) as object,
-    raw: JSON.parse(message.message.raw),
-  };
-}
-
-async function next(args: Args): Promise<void> {
-  const client = await redis(args);
-  const stream = streamName(args);
-  const group = groupName(args);
-  const consumer = consumerName(args);
-  await ensureGroup(client, stream, group);
-  const response = await client.xReadGroup(group, consumer, [{ key: stream, id: ">" }], { COUNT: 1, BLOCK: 1 });
-  if (!response?.length || !response[0]?.messages.length) {
-    console.log("No queued jobs.");
-    await client.quit();
+function next(args: Args): void {
+  const db = openDb(args);
+  const worker = asString(args.worker, `worker-${process.pid}`)!;
+  const leaseMs = parseDurationMs(asString(args.lease, "90m"), DEFAULT_LEASE_MS);
+  const raw = hasFlag(args, "raw");
+  const now = nowIso();
+  const leaseUntil = addMsIso(leaseMs);
+  const tx = db.transaction(() => {
+    const item = db.prepare(`SELECT * FROM items
+      WHERE status='queued' OR (status='delivered' AND lease_until IS NOT NULL AND lease_until < ?)
+      ORDER BY latest_notification_updated_at ASC, updated_at ASC
+      LIMIT 1`).get(now) as ItemRow | undefined;
+    if (!item) return undefined;
+    const changed = db.prepare(`UPDATE items SET
+      status='delivered',
+      dirty=0,
+      attempts=attempts + 1,
+      delivered_at=?,
+      lease_until=?,
+      worker_id=?,
+      updated_at=?
+      WHERE repo=? AND number=? AND (status='queued' OR (status='delivered' AND lease_until IS NOT NULL AND lease_until < ?))`)
+      .run(now, leaseUntil, worker, now, item.repo, item.number, now).changes;
+    if (!changed) return undefined;
+    const updated = db.prepare("SELECT * FROM items WHERE repo=? AND number=?").get(item.repo, item.number) as ItemRow;
+    return {
+      item: {
+        repo: updated.repo,
+        number: updated.number,
+        type: updated.subject_type,
+        status: updated.status,
+        attempts: updated.attempts,
+        notificationCount: updated.notification_count,
+        latestNotificationUpdatedAt: updated.latest_notification_updated_at,
+        leaseUntil: updated.lease_until,
+        workerId: updated.worker_id,
+      },
+      notifications: itemNotifications(db, updated, raw),
+    };
+  });
+  const payload = tx();
+  if (!payload) {
+    console.log("No queued items.");
     return;
   }
-  const message = response[0].messages[0];
-  const payload = hasFlag(args, "raw") ? rawPayload(message, stream, group, consumer) : compactPayload(message, stream, group, consumer);
-  if (hasFlag(args, "ack")) await client.xAck(stream, group, message.id);
   console.log(JSON.stringify(payload, null, 2));
-  await client.quit();
 }
 
-async function ack(args: Args): Promise<void> {
-  const id = args._[1];
-  if (!id) throw new Error("ack requires a stream message id");
-  const client = await redis(args);
-  const count = await client.xAck(streamName(args), groupName(args), id);
-  console.log(JSON.stringify({ acked: count, id }));
-  await client.quit();
+function ack(args: Args): void {
+  const repo = asString(args.repo);
+  const number = Number(asString(args.number));
+  if (!repo || !Number.isFinite(number)) throw new Error("ack requires --repo owner/name --number n");
+  const db = openDb(args);
+  const ts = nowIso();
+  const item = db.prepare("SELECT dirty FROM items WHERE repo=? AND number=? AND status='delivered'").get(repo, number) as { dirty: number } | undefined;
+  if (!item) throw new Error("No delivered item found for ack");
+  if (item.dirty) {
+    db.prepare(`UPDATE items SET status='queued', dirty=0, delivered_at=NULL, lease_until=NULL, worker_id=NULL, updated_at=? WHERE repo=? AND number=?`).run(ts, repo, number);
+    console.log(JSON.stringify({ repo, number, status: "queued", dirtyWasSet: true }));
+  } else {
+    db.prepare(`UPDATE items SET status='done', delivered_at=NULL, lease_until=NULL, worker_id=NULL, updated_at=? WHERE repo=? AND number=?`).run(ts, repo, number);
+    console.log(JSON.stringify({ repo, number, status: "done" }));
+  }
 }
 
-async function pending(args: Args): Promise<void> {
-  const client = await redis(args);
-  await ensureGroup(client, streamName(args), groupName(args));
-  const result = await client.xPending(streamName(args), groupName(args));
-  console.log(JSON.stringify(result, null, 2));
-  await client.quit();
+function fail(args: Args): void {
+  const repo = asString(args.repo);
+  const number = Number(asString(args.number));
+  if (!repo || !Number.isFinite(number)) throw new Error("fail requires --repo owner/name --number n");
+  const maxAttempts = Number(asString(args["max-attempts"], String(DEFAULT_MAX_ATTEMPTS)));
+  const reason = asString(args.reason, "")!;
+  const db = openDb(args);
+  const ts = nowIso();
+  const item = db.prepare("SELECT attempts FROM items WHERE repo=? AND number=? AND status='delivered'").get(repo, number) as { attempts: number } | undefined;
+  if (!item) throw new Error("No delivered item found for fail");
+  const status = item.attempts >= maxAttempts ? "failed" : "queued";
+  db.prepare(`UPDATE items SET status=?, dirty=0, delivered_at=NULL, lease_until=NULL, worker_id=NULL, last_error=?, updated_at=? WHERE repo=? AND number=?`).run(status, reason, ts, repo, number);
+  console.log(JSON.stringify({ repo, number, status, attempts: item.attempts }));
+}
+
+function stats(args: Args): void {
+  const db = openDb(args);
+  const rows = db.prepare("SELECT status, COUNT(*) AS count FROM items GROUP BY status ORDER BY status").all();
+  console.log(JSON.stringify(rows, null, 2));
 }
 
 function usage(): void {
-  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  watch --repo owner/name [--redis url] [--stream name] [--interval 60s]\n  next [--redis url] [--stream name] [--group name] [--consumer name] [--ack] [--raw]\n  ack <streamId> [--redis url] [--stream name] [--group name]\n  pending [--redis url] [--stream name] [--group name]`);
+  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  watch --repo owner/name [--db path] [--interval 60s]\n  next [--db path] [--worker id] [--lease 90m] [--raw]\n  ack --repo owner/name --number n [--db path]\n  fail --repo owner/name --number n [--db path] [--reason text] [--max-attempts 5]\n  stats [--db path]`);
 }
 
 async function main(): Promise<void> {
@@ -283,9 +400,10 @@ async function main(): Promise<void> {
   const command = args._[0];
   try {
     if (command === "watch") await watch(args);
-    else if (command === "next") await next(args);
-    else if (command === "ack") await ack(args);
-    else if (command === "pending") await pending(args);
+    else if (command === "next") next(args);
+    else if (command === "ack") ack(args);
+    else if (command === "fail") fail(args);
+    else if (command === "stats") stats(args);
     else {
       usage();
       process.exitCode = command ? 1 : 0;
