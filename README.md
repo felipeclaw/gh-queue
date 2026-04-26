@@ -51,6 +51,7 @@ A leased item remains `delivered` until `ack`, `fail`, or lease expiry.
 - If another notification arrives for an item while it is `delivered`, the item is marked `dirty`.
 - `ack` marks a delivered item `done`, unless it is dirty; dirty delivered items return to `queued` for another pass.
 - `fail` returns a delivered item to `queued` until `--max-attempts`, then marks it `failed`.
+- If `fail` sees that the item is dirty, it returns the item to `queued` even when max attempts has been reached, so newer notifications are not buried by an older failed attempt.
 - Expired leases can be picked up again by `next`.
 
 ## Payloads
@@ -111,6 +112,7 @@ Requirements:
 - Choose `--lease` longer than the expected processing time.
 - A worker should not call `ack` until all side effects for the leased item are complete.
 - A worker should call `fail` when processing fails so the item can be retried or eventually marked `failed`.
+- A dirty item always gets another pass, even when the current attempt fails.
 - Keep the SQLite database on a local disk, not a network filesystem.
 - `gh-queue` does not mark GitHub notifications as read.
 

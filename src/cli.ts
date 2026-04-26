@@ -378,11 +378,12 @@ function fail(args: Args): void {
   const reason = asString(args.reason, "")!;
   const db = openDb(args);
   const ts = nowIso();
-  const item = db.prepare("SELECT attempts FROM items WHERE repo=? AND number=? AND status='delivered'").get(repo, number) as { attempts: number } | undefined;
+  const item = db.prepare("SELECT attempts, dirty FROM items WHERE repo=? AND number=? AND status='delivered'").get(repo, number) as { attempts: number; dirty: number } | undefined;
   if (!item) throw new Error("No delivered item found for fail");
-  const status = item.attempts >= maxAttempts ? "failed" : "queued";
+  const dirtyWasSet = item.dirty === 1;
+  const status = dirtyWasSet || item.attempts < maxAttempts ? "queued" : "failed";
   db.prepare(`UPDATE items SET status=?, dirty=0, delivered_at=NULL, lease_until=NULL, worker_id=NULL, last_error=?, updated_at=? WHERE repo=? AND number=?`).run(status, reason, ts, repo, number);
-  console.log(JSON.stringify({ repo, number, status, attempts: item.attempts }));
+  console.log(JSON.stringify({ repo, number, status, attempts: item.attempts, dirtyWasSet }));
 }
 
 function stats(args: Args): void {
