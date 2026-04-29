@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { resolve } from "node:path";
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_DB = "./gh-queue.db";
+const DEFAULT_DB = "./ghq-notifications.db";
 const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_LEASE_MS = 90 * 60 * 1000;
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -393,7 +393,7 @@ function stats(args: Args): void {
 }
 
 function usage(): void {
-  console.log(`Usage: gh-queue <command> [options]\n\nCommands:\n  watch --repo owner/name [--db path] [--interval 60s]\n  next [--db path] [--worker id] [--lease 90m] [--raw]\n  ack --repo owner/name --number n [--db path]\n  fail --repo owner/name --number n [--db path] [--reason text] [--max-attempts 5]\n  stats [--db path]`);
+  console.log(`Usage: ghq-notifications <command> [options]\n\nCommands:\n  watch --repo owner/name [--db path] [--interval 60s]\n  next [--db path] [--worker id] [--lease 90m] [--raw]\n  ack --repo owner/name --number n [--db path]\n  fail --repo owner/name --number n [--db path] [--reason text] [--max-attempts 5]\n  stats [--db path]`);
 }
 
 async function main(): Promise<void> {

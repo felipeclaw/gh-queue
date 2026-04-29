@@ -1,10 +1,10 @@
 {
-  "name": "gh-queue",
+  "name": "ghq-notifications",
   "version": "0.1.0",
   "description": "Queue GitHub notifications by issue and pull request number.",
   "type": "module",
   "bin": {
-    "gh-queue": "dist/cli.js"
+    "ghq-notifications": "dist/cli.js"
   },
   "files": [
     "dist",

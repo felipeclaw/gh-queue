@@ -1,39 +1,41 @@
-# gh-queue
+# ghq-notifications
 
-`gh-queue` is a small production-oriented CLI that watches GitHub notifications for selected repositories and stores a local SQLite queue keyed by GitHub item number.
+`ghq-notifications` is a small production-oriented CLI that watches GitHub notifications for selected repositories and stores a local SQLite queue keyed by GitHub item number.
+
+“ghq” means “GitHub queue”; this package is specifically the notifications-backed queue.
 
 GitHub issues and pull requests share a number namespace within a repository, so multiple notifications for the same issue/PR coalesce into one queue item.
 
 ## Command summary
 
 ```text
-gh-queue watch --repo owner/name [--db path] [--interval 60s]
-gh-queue next [--db path] [--worker id] [--lease 90m] [--raw]
-gh-queue ack --repo owner/name --number n [--db path]
-gh-queue fail --repo owner/name --number n [--db path] [--reason text] [--max-attempts 5]
-gh-queue stats [--db path]
+ghq-notifications watch --repo owner/name [--db path] [--interval 60s]
+ghq-notifications next [--db path] [--worker id] [--lease 90m] [--raw]
+ghq-notifications ack --repo owner/name --number n [--db path]
+ghq-notifications fail --repo owner/name --number n [--db path] [--reason text] [--max-attempts 5]
+ghq-notifications stats [--db path]
 ```
 
 ## Processing contract
 
-`gh-queue` is only the queue. The consumer is responsible for completing each leased item.
+`ghq-notifications` is only the queue. The consumer is responsible for completing each leased item.
 
 1. Run one long-lived watcher:
    ```bash
-   gh-queue watch --repo owner/repo --db /var/lib/gh-queue/queue.db --interval 60s
+   ghq-notifications watch --repo owner/repo --db /var/lib/ghq-notifications/queue.db --interval 60s
    ```
 2. Each worker leases work with `next`:
    ```bash
-   gh-queue next --db /var/lib/gh-queue/queue.db --worker worker-1 --lease 90m
+   ghq-notifications next --db /var/lib/ghq-notifications/queue.db --worker worker-1 --lease 90m
    ```
 3. If `next` prints `No queued items.`, there is no work.
 4. If processing succeeds, the worker **must** call `ack`:
    ```bash
-   gh-queue ack --db /var/lib/gh-queue/queue.db --repo owner/repo --number 123
+   ghq-notifications ack --db /var/lib/ghq-notifications/queue.db --repo owner/repo --number 123
    ```
 5. If processing fails, the worker **must** call `fail`:
    ```bash
-   gh-queue fail --db /var/lib/gh-queue/queue.db --repo owner/repo --number 123 --reason "processing failed"
+   ghq-notifications fail --db /var/lib/ghq-notifications/queue.db --repo owner/repo --number 123 --reason "processing failed"
    ```
 
 A leased item remains `delivered` until `ack`, `fail`, or lease expiry.
@@ -97,7 +99,7 @@ Use `--raw` to include the original GitHub notification payloads.
 ```bash
 npm install
 npm run build
-npm link   # optional, exposes gh-queue locally
+npm link   # optional, exposes ghq-notifications locally
 ```
 
 Requirements:
@@ -114,7 +116,7 @@ Requirements:
 - A worker should call `fail` when processing fails so the item can be retried or eventually marked `failed`.
 - A dirty item always gets another pass, even when the current attempt fails.
 - Keep the SQLite database on a local disk, not a network filesystem.
-- `gh-queue` does not mark GitHub notifications as read.
+- `ghq-notifications` does not mark GitHub notifications as read.
 
 ## Development
 
@@ -124,4 +126,4 @@ npm run check
 npm run build
 ```
 
-The executable is `dist/cli.js` and the package bin is named `gh-queue`.
+The executable is `dist/cli.js` and the package bin is named `ghq-notifications`.
